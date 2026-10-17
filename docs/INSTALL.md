@@ -219,7 +219,9 @@ says so and starts the engine you had.
   262K").
 - **Images?** Whether it should also read pictures. The image encoder (0.9 GB) runs on the GPU (0.1-0.5 s per
   picture, ~1.4 GB of VRAM kept free for it) or on the CPU (about 3-13 s per picture, nothing on the GPU); with AMD cards
-  on the CPU for now. [Details](DETAILS.md#images-vision).
+  on the CPU for now. [Details](DETAILS.md#images-vision). Not asked when the model's folder already has its image
+  encoder (an `mmproj*.gguf`, as the GGUF repositories ship it): setup uses that file instead of downloading one and
+  turns images on (`--vision no` keeps them off).
 - **Experimental speed projection?** Off unless you say yes - [read what it does](DETAILS.md#experimental-speed-projection-experimental-off-by-default)
   first. It changes how the model answers, and only the original model offers it.
 
@@ -241,7 +243,8 @@ NVIDIA cards for now. [What it measures](DETAILS.md#double-click-start-herebat).
 START-HERE.bat --setup                          install another model, or change context / images
 SETUP.bat                                       the same (double-click it)
 START-HERE.bat --model IQ2_XS --context 32768 --vision yes --yes     no questions
-START-HERE.bat --gguf-dir D:\models\IQ2_XS       use GGUF files you already have
+START-HERE.bat --gguf-dir D:\models\IQ2_XS       use GGUF files you already have (an mmproj*.gguf there turns images on)
+START-HERE.bat --mmproj D:\models\mmproj-Q8_0.gguf   an image encoder of your own (images on)
 START-HERE.bat --inspect D:\models\some.gguf     what a GGUF really holds and whether Strata runs it (no download)
 START-HERE.bat --data-dir E:\Strata-data         keep the model files somewhere else
 START-HERE.bat --port 8081                      another port

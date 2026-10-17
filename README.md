@@ -163,7 +163,8 @@ Sizes, downloads and what fits where: [docs/MODELS.md](docs/MODELS.md). To add a
     ([setup](docs/DETAILS.md#the-responses-api-and-codex-cli)).
 - **Thinking:** choose **off, low, medium or high** in the chat menu or in your app's "reasoning effort". Off is the
   fastest. High is best for hard questions.
-- **Pictures:** say yes to "Images?" in setup. Then click **Picture** in the chat, or attach pictures in your app.
+- **Pictures:** say yes to "Images?" in setup (or put the model's `mmproj*.gguf` next to its model files: setup finds
+  it and turns images on). Then click **Picture** in the chat, or attach pictures in your app.
   AMD cards read pictures on Linux through the processor; on Windows they can't yet.
 - **From your phone or another PC:** `START-HERE.bat --setup --host 0.0.0.0 --api-key <secret>`. Always set a key.
 - **One request at a time:** by default Strata answers one request, and the others wait. To answer several at once,

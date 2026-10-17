@@ -1468,6 +1468,18 @@ The model has a vision encoder: [`mmproj-Qwen3.8-Flash-Next-BF16.gguf`](https://
 "Images?", or run it again with `--vision gpu` (or `--vision cpu`). The setup downloads the encoder, builds a small
 helper (`strata-vision`, from llama.cpp's `mtmd` library) and adds it to your start script. Nothing else changes.
 
+**An encoder already next to the model:** when the model's folder (`<data folder>/models/<model>`, or `--gguf-dir`)
+holds an image encoder - any `*mmproj*.gguf`, the name the GGUF repositories give it - setup uses that file instead of
+the download and turns images on without asking (on the GPU with NVIDIA, on the CPU with AMD on Linux; `--vision cpu`
+or `--vision no` as usual). The rest is the same as answering yes: the engine starts with `--vision` and the encoder's
+VRAM reserve, `strata-vision` is fetched or built, and the run config's `"vision"` section names the file. Setup reads
+the file's headers first and names any file it does not use, with the reason: not an image encoder, cut off, or made
+for another model (its `clip.vision.projection_dim` is not 2560, this model's width). With several, the model's own
+file name comes first; `--mmproj FILE` picks one by hand. An encoder put there after setup: the next start with
+`START-HERE.bat` (Linux: `./setup.sh`) sets that model up again with images, with its other settings kept and nothing
+big downloaded (`run-<model>.bat` starts the server directly, so it does not look). After `--vision no` with the file
+there, the config remembers it as `"vision_declined"` and starts do not ask again.
+
 | Encoder on | Time per picture | Cost |
 | --- | --- | --- |
 | **GPU** (recommended) | **0.1-0.5 s** (up to 1,024 image tokens) | ~1.4 GB of VRAM is kept free for it, so the expert cache is smaller: text output is a few % slower (table below) |

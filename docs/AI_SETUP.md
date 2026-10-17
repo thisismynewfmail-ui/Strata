@@ -95,7 +95,8 @@ The flags (all of them: `START-HERE.bat --help`):
 | `--family qwen\|swift\|coder\|unsloth` | the model version |
 | `--model Q2_0\|IQ2_XS\|IQ3_XXS\|IQ3_S\|IQ1_M\|UD-IQ4_XS\|UD-Q4_K_XL` | the size (the Coder is IQ1_M, Unsloth UD-IQ4_XS or UD-Q4_K_XL) |
 | `--context N` | context in tokens; default by VRAM: 32768 under 14 GB, 65536 under 20 GB, else 131072 |
-| `--vision yes\|no\|gpu\|cpu` | read pictures; `--yes` leaves images off. AMD cards: `cpu` |
+| `--vision yes\|no\|gpu\|cpu` | read pictures; `--yes` leaves images off, unless an `mmproj*.gguf` of the model is next to its files (then on, that file used). AMD cards: `cpu` |
+| `--mmproj FILE` | an image encoder of the model to use instead of downloading one; images on unless `--vision no` |
 | `--gpu N` / `--gpus 0,1` / `--gpus all` | one card, or several sharing the model (default: the card with the most VRAM) |
 | `--backend cuda\|hip` | NVIDIA or AMD engine; chosen by itself on a PC with only one kind of card |
 | `--data-dir PATH` | where the 70-120 GB of model files go |
