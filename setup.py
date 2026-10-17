@@ -16,7 +16,8 @@ What the first run does (each step is skipped when it is already done):
   4. gets the Strata engine: a ready-made build for RTX 20/30/40/50 cards (no compiler needed); if none fits your PC,
      it installs the build tools (asks first) and compiles the engine for your GPU.  AMD (--backend hip, chosen by
      itself on a PC with no usable NVIDIA card): the ready-made HIP engine on Windows, compiled here on Linux
-  5. downloads the model from Hugging Face (resumable), and the vision encoder if you want images
+  5. downloads the model from Hugging Face (resumable), and the vision encoder if you want images (an mmproj*.gguf
+     already next to the model's files is found and used instead: images are then on without the question)
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.bat / run-<model>.sh and starts the model
 
@@ -27,7 +28,8 @@ at least 1 - an explicit --rope-scaling none is refused for such a context), --v
 answers, no questions), --setup (install another model / change settings instead of starting), --no-start,
 --host 0.0.0.0 --api-key KEY (reach it from other devices on your network), --experimental-speed-projection on|off
 (EXPERIMENTAL, off by default),
---models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --build (compile instead of the ready-made
+--models-dir DIR, --gguf-dir DIR (use GGUF files you already have), --mmproj FILE (an image encoder of your own; one
+next to the model's files is found by itself), --build (compile instead of the ready-made
 engine), --check (only check this PC), --resident-budget-gib N (UD-Q4_K_XL's or UD-IQ4_XS's experts in RAM),
 --kv-streaming on|off|auto.
 
@@ -1782,6 +1784,118 @@ def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple 
     if usable:
         hint += ".\n       Usable here: " + ", ".join(f"--family {f} --model {m}" for f, m in usable)
     return f"{folder} has no {fam['title']} {model} file", hint
+
+
+# An image encoder the user put next to the model's files (an mmproj*.gguf, as the GGUF repositories ship it): setup
+# uses it instead of downloading one, and images are on without the question.  Every Flash-Next family's text model is
+# 2560 wide (qwen4exp.embedding_length), so an encoder made for another model is told apart by its projection width -
+# strata-vision reads that width from clip.vision.projection_dim and refuses a file without it.
+FLASH_NEXT_EMBD = 2560
+
+
+def mmproj_name(name: str) -> bool:
+    """A file name an image encoder goes by: "mmproj" in it, a .gguf (or .mmproj) file."""
+    n = name.lower()
+    return "mmproj" in n and n.endswith((".gguf", ".mmproj"))
+
+
+def mmproj_problem(p: Path) -> str | None:
+    """Why `p` cannot be this model's image encoder (not a GGUF, no vision encoder in it, made for a model of another
+    width, cut off), from its headers only; None when strata-vision can use it."""
+    sys.path.insert(0, str(ROOT / "tools"))
+    from gguf_reader import GGUFFile
+    try:
+        g = GGUFFile(p)
+    except (OSError, ValueError, KeyError, struct.error) as e:
+        return f"not a GGUF file setup can read ({e})"
+    md = getattr(g, "metadata", None) or {}
+    if md.get("general.architecture") != "clip" or md.get("clip.has_vision_encoder") is False:
+        return "it is not an image encoder"
+    width = md.get("clip.vision.projection_dim")
+    if not isinstance(width, int):
+        return "it has no clip.vision.projection_dim, which strata-vision needs"
+    if width != FLASH_NEXT_EMBD:
+        return f"it is made for another model (its projection is {width} wide, this model's is {FLASH_NEXT_EMBD})"
+    if p.stat().st_size < g.data_start + max((t.offset + (t.expected_bytes() or 0) for t in g.tensors), default=0):
+        return "it is cut off (shorter than its own tensor directory says): a download that did not finish?"
+    return None
+
+
+def find_mmproj(folders, fam: dict, quiet: bool = False) -> Path | None:
+    """The image encoder next to the model's files: in the first of `folders` that has a usable one, the family's own
+    file name first, then by name.  A file that cannot be used is named with the reason (unless quiet)."""
+    for folder in dict.fromkeys(Path(f) for f in folders):
+        try:
+            cands = sorted((p for p in folder.iterdir() if mmproj_name(p.name) and p.is_file()),
+                           key=lambda p: (p.name != fam.get("mmproj"), p.name.lower()))
+        except OSError:                                # no such folder (yet)
+            continue
+        good = []
+        for p in cands:
+            why = mmproj_problem(p)
+            if why is None:
+                good.append(Path(os.path.abspath(p)))
+            elif not quiet:
+                warn(f"{p} is not used as the image encoder: {why}")
+        if good:
+            if len(good) > 1 and not quiet:
+                say(f"  {len(good)} image encoders are next to the model: {good[0].name} is used "
+                    f"(--mmproj FILE picks another: {', '.join(x.name for x in good[1:])})")
+            return good[0]
+    return None
+
+
+def model_folders(a, fam: dict, model: str, tag: str, elsewhere: list) -> list:
+    """Where this choice's model files are or go (step 5's folder), for find_mmproj: --gguf-dir; else <models>/<tag>
+    (a ready-made pack: its repository folder and its dense GGUF's), then the same folder of a Strata folder elsewhere
+    on this PC (the files found there are used)."""
+    if a.gguf_dir:
+        return [Path(a.gguf_dir)]
+    roots = [Path(a.models_dir), *(r / "models" for r in elsewhere)]
+    if fam.get("ready"):
+        return [p for r in roots for p in (r / MODELS[model]["repo"].replace("/", "--"),
+                                           ready_paths(model, r)["dense"].parent)]
+    return [r / tag for r in roots]
+
+
+def unused_mmproj(cfg_path: Path) -> Path | None:
+    """START-HERE on a model set up without images: an image encoder now next to its files (the folder of its --native
+    file) that this install can run, which setup did not leave off on purpose (the config's "vision_declined": images
+    off by --vision no, or for a model or an engine without them).  None otherwise, and for a config setup cannot
+    read."""
+    try:
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+        ch = choices_from_config(cfg_path)
+    except (OSError, ValueError, KeyError, TypeError, AttributeError):
+        return None
+    if not isinstance(cfg, dict) or cfg.get("vision") or ch["family"] not in FAMILIES or ch["model"] is None:
+        return None
+    fam = FAMILIES[ch["family"]]
+    if MODELS[ch["model"]].get("vision", fam.get("vision")) is False or cfg.get("backend") == "sycl" or \
+            (cfg.get("backend") == "hip" and WIN):    # no image encoder on Intel Arc, nor in the Windows AMD engine
+        return None
+    native = flag_value(cfg.get("args") if isinstance(cfg.get("args"), list) else [], "--native")
+    found = find_mmproj([Path(native).parent], fam, quiet=True) if native else None
+    return None if found is None or str(found) == cfg.get("vision_declined") else found
+
+
+def keep_model_folder(a, cfg_path: Path, elsewhere: list) -> None:
+    """A model set up again from its config (unused_mmproj): its files stay where they are.  A folder setup does not
+    look in by itself (given with --gguf-dir or --models-dir at the first setup, which the config does not record as
+    such) is given again from its --native file: --gguf-dir for GGUF shards, --models-dir for a ready-made pack."""
+    cfg = json.loads(cfg_path.read_text(encoding="utf-8-sig"))
+    ch = choices_from_config(cfg_path)
+    native = flag_value(cfg.get("args") if isinstance(cfg.get("args"), list) else [], "--native")
+    if not native or a.gguf_dir or ch["family"] not in FAMILIES or ch["model"] is None:
+        return
+    fam, model = FAMILIES[ch["family"]], ch["model"]
+    if fam.get("ready"):                               # <models>/<owner>--<repo>/<its path in the repository>
+        repo = MODELS[model]["repo"].replace("/", "--")
+        root = next((d.parent for d in Path(native).parents if d.name == repo), None)
+        if root is not None:
+            a.models_dir = str(root)
+    elif Path(native).parent not in model_folders(a, fam, model, fam["tag"] + model, elsewhere):
+        a.gguf_dir = str(Path(native).parent)
 
 
 def verify_sha256(s: Path, size: int, sha: str) -> None:
@@ -4413,7 +4527,8 @@ def write_config(path: Path, cfg: dict):
 # #629: the run config's keys setup writes itself (and rewrites on every setup run); any other key is the user's - a
 # "sampling" or "mcp_servers" block, "allowed_hosts", "cors_origins", "open_browser" - and is kept when setup runs again
 SETUP_KEYS = frozenset({"exe", "args", "cwd", "tokenizer", "model_name", "log", "lib_dirs", "port", "backend", "env",
-                        "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision"})
+                        "gpu", "gpus_asked", "layer_split", "host", "api_key", "draft_vocab", "vision",
+                        "vision_declined"})
 SETUP_ENV = frozenset({"STRATA_HIPBLASLT_TUNING", "STRATA_RESIDENT_PIN", "STRATA_NO_ARENA_THP", "STRATA_MMQ_KQ", "STRATA_HC_Q8",
                        "STRATA_ROUTE_TAIL_SKIP"})   # the "env" entries setup writes
 # 0.1.44 added these three, written for Unsloth's files only (unsloth_default_env).  In any other model's config they are the
@@ -4423,10 +4538,11 @@ SETUP_ENV_UNSLOTH = frozenset({"STRATA_MMQ_KQ", "STRATA_HC_Q8", "STRATA_ROUTE_TA
 SETUP_VISION = frozenset({"exe", "mmproj", "model", "gpu", "max_tokens", "threads"})
 
 
-def carry_over(old: dict, cfg: dict) -> list[str]:
+def carry_over(old: dict, cfg: dict, keep_mmproj: bool = True) -> list[str]:
     """#629: setup run again for an installed model keeps what the user added to its run config: every key setup does
     not write (`SETUP_KEYS`), the "env" entries setup does not write, and in "vision" the keys setup does not write
-    plus an mmproj of their own (a Q8_0 one, #625) that still exists.  `cfg` (the new config) is updated in place;
+    plus an mmproj of their own (a Q8_0 one, #625) that still exists - unless the new config's is one of theirs too
+    (keep_mmproj False: --mmproj, or found next to the model).  `cfg` (the new config) is updated in place;
     the names of what was kept are returned.  Engine options added by hand to "args" are not merged (setup chooses
     those): `args_dropped` names them."""
     kept = []
@@ -4447,7 +4563,8 @@ def carry_over(old: dict, cfg: dict) -> list[str]:
                 nv[k] = v
                 kept.append(f"vision {k}")
         mm = ov.get("mmproj")                          # a file of the user's own: not the one setup downloads
-        if isinstance(mm, str) and Path(mm).name != Path(str(nv.get("mmproj"))).name and Path(mm).is_file():
+        if keep_mmproj and isinstance(mm, str) and Path(mm).name != Path(str(nv.get("mmproj"))).name and \
+                Path(mm).is_file():
             nv["mmproj"] = mm
             kept.append("vision mmproj")
     kept += carry_profile_args(old, cfg)
@@ -4492,11 +4609,12 @@ def args_dropped(old: dict, cfg: dict) -> list[str]:
     return list(dict.fromkeys(f for f in flags(old) if f not in new))
 
 
-def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None) -> None:
+def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None, keep_mmproj: bool = True) -> None:
     """#629: setup's run config, written over an earlier one for the same model without losing what the user added
     to it: the keys setup does not write are carried over (carry_over), and the earlier file is kept as
     strata-<model>.json.bak when it changes.  `source`: an earlier install's config to carry the keys over from when
-    this folder has none yet (a copy set up like the last one).  A line says what was kept, one what was not."""
+    this folder has none yet (a copy set up like the last one).  keep_mmproj: carry_over's.  A line says what was
+    kept, one what was not."""
     old_path = cfg_path if cfg_path.is_file() else source
     old = None
     if old_path is not None and old_path.is_file():
@@ -4506,7 +4624,7 @@ def write_setup_config(cfg_path: Path, cfg: dict, source: Path | None = None) ->
             pass
         if not isinstance(old, dict):
             old = None
-    kept = carry_over(old, cfg) if old is not None else []
+    kept = carry_over(old, cfg, keep_mmproj) if old is not None else []
     if "images" in cfg and cfg["images"] is None:      # --images no (or not downloaded): no image section
         cfg.pop("images")
     bak = None
@@ -5702,6 +5820,27 @@ def preview_family(a) -> int:
     return 0
 
 
+def adopt_choices(a, ch: dict) -> None:
+    """#629: setup's answers taken from an earlier config (choices_from_config) where none was given on the command
+    line, answered without questions (--yes): a copy set up like the last one, or a model set up again with images."""
+    a.family, a.model, a.context = ch["family"], ch["model"], a.context or ch["context"]
+    a.kv = a.kv or ch["kv"]
+    a.vision = a.vision or ch["vision"]
+    a.experimental_speed_projection = a.experimental_speed_projection or ch["esp"]
+    a.host, a.api_key = a.host or ch["host"], a.api_key or ch["api_key"]
+    a.port = a.port or ch["port"]
+    if a.vram_reserve_mib is None:                      # #493: an explicit reserve set up before
+        a.vram_reserve_mib = ch.get("vram_reserve_mib")
+    if a.cuda is None and ch.get("cuda") == 12:        # the experimental CUDA 12 engine, as before
+        a.cuda = "12"
+    if isinstance(ch.get("gpu"), list):                # a layer split: set up across the same cards again
+        a.gpus = a.gpus or ",".join(str(g) for g in ch["gpu"])
+        a.layer_split = a.layer_split or ch.get("layer_split")
+    else:
+        a.gpu = a.gpu if a.gpu is not None else ch.get("gpu")
+    a.yes = True
+
+
 def main() -> int:
     if sys.platform == "darwin":                       # a Mac: metal/setup_mac.py (the Metal engine)
         return mac_setup(sys.argv[1:])
@@ -5724,6 +5863,10 @@ def main() -> int:
                          "precise) or k8v4 (hybrid: INT8 K + 4-bit V, 816 B/cell)")
     ap.add_argument("--vision", choices=["yes", "no", "none", "gpu", "cpu"],
                     help="let the model read images (yes = the encoder on the GPU)")
+    ap.add_argument("--mmproj", metavar="FILE",
+                    help="an image encoder (mmproj .gguf) of this model to use instead of downloading one; images are "
+                         "on unless --vision no. Without it, an mmproj*.gguf next to the model's files is found and "
+                         "used by itself")
     ap.add_argument("--vision-tokens", type=int, metavar="N",
                     help="the most image tokens a picture becomes (default 1024 with the encoder on the GPU, 300 on "
                          "the CPU): more reads small text and charts better, and takes longer to encode; remembered "
@@ -5823,6 +5966,7 @@ def main() -> int:
                          "sycl = Intel Arc, EXPERIMENTAL: Linux, built from source (docs/INTEL_ARC.md)")
     ap.add_argument("--skip-build", action="store_true", help=argparse.SUPPRESS)
     a = ap.parse_args()
+    cli_vision = a.vision                              # --vision as given (an earlier install's choice is set below)
     if a.model and a.model not in MODELS and a.family not in PREVIEW_FAMILIES:
         ap.error(f"--model {a.model} is a size of " + ", ".join(f"--family {f}" for f, d in PREVIEW_FAMILIES.items()
                                                               if a.model in d["models"]))
@@ -5867,23 +6011,8 @@ def main() -> int:
             if ch["model"]:
                 say(f"  Found your earlier install in {prev.parent} ({prev.stem[len('strata-'):]}): setting up this "
                     "copy the same way - the model files are reused, nothing big is downloaded.")
-                a.family, a.model, a.context = ch["family"], ch["model"], a.context or ch["context"]
+                adopt_choices(a, ch)
                 adopted = prev
-                a.kv = a.kv or ch["kv"]
-                a.vision = a.vision or ch["vision"]
-                a.experimental_speed_projection = a.experimental_speed_projection or ch["esp"]
-                a.host, a.api_key = a.host or ch["host"], a.api_key or ch["api_key"]
-                a.port = a.port or ch["port"]
-                if a.vram_reserve_mib is None:          # #493: an explicit reserve set up before
-                    a.vram_reserve_mib = ch.get("vram_reserve_mib")
-                if a.cuda is None and ch.get("cuda") == 12:   # the experimental CUDA 12 engine, as before
-                    a.cuda = "12"
-                if isinstance(ch.get("gpu"), list):     # a layer split: set up across the same cards again
-                    a.gpus = a.gpus or ",".join(str(g) for g in ch["gpu"])
-                    a.layer_split = a.layer_split or ch.get("layer_split")
-                else:
-                    a.gpu = a.gpu if a.gpu is not None else ch.get("gpu")
-                a.yes = True
     global GPU_PICK, OLD_GPUS
     # starting an installed model: --gpus 0,2 (or all) saves those cards for it and starts on them (it used to start
     # on the first one alone unless given with --setup), --gpu N runs this start on one card; neither: the saved
@@ -5919,19 +6048,30 @@ def main() -> int:
     if have and not (a.setup or a.model or a.family or a.check or a.no_start):
         if not a.build:
             update_installed_engine(a.prebuilt)
-        if len(have) == 1:
-            return start(have[0], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                           "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
-        say()
-        for i, c in enumerate(have, 1):
-            say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
-        say(f"  {len(have) + 1}) install another model / change settings")
-        pick = int(ask("Which one?", [str(i) for i in range(1, len(have) + 2)], "1", a.yes))
-        if pick <= len(have):
-            return start(have[pick - 1], a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
-                     keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
-                           "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+        pick_cfg = have[0] if len(have) == 1 else None
+        if pick_cfg is None:
+            say()
+            for i, c in enumerate(have, 1):
+                say(f"  {i}) {json.loads(c.read_text(encoding='utf-8-sig')).get('model_name', c.stem)}")
+            say(f"  {len(have) + 1}) install another model / change settings")
+            pick = int(ask("Which one?", [str(i) for i in range(1, len(have) + 2)], "1", a.yes))
+            if pick <= len(have):
+                pick_cfg = have[pick - 1]
+        mm = None if pick_cfg is None else unused_mmproj(pick_cfg) if not a.mmproj else \
+            Path(a.mmproj) if choices_from_config(pick_cfg)["family"] in FAMILIES else None
+        if pick_cfg is not None and mm is None:
+            return start(pick_cfg, a.port, run_gpu, yes=a.yes, layer_split=a.layer_split,
+                         keep={"host": a.host, "api_key": a.api_key, "draft_vocab": a.draft_vocab,
+                               "vram_reserve_mib": a.vram_reserve_mib, "open_browser": a.browser})
+        if mm is not None:                             # --mmproj, or an encoder put next to a text-only model's files
+            say()
+            if not a.mmproj:
+                ok(f"image encoder found next to the model: {mm}")
+            say(f"  Setting {pick_cfg.stem[len('strata-'):]} up again with images and the choices it was set up "
+                "with - the model files are reused, nothing big is downloaded (--vision no keeps images off).")
+            keep_model_folder(a, pick_cfg, elsewhere)
+            adopt_choices(a, choices_from_config(pick_cfg))
+            port = a.port or 8080
 
     # ---- 1. the PC
     step(1, "checking your PC")
@@ -6293,10 +6433,27 @@ def main() -> int:
         kv = ["int8", "q4_0"][int(ask("KV cache?", ["1", "2"], "1", a.yes)) - 1]
     if ctx > 8192:
         ok(f"KV cache: {'8-bit' if kv == 'int8' else '4-bit (Hadamard-rotated)'}")
+    # the image encoder next to the model's files (or --mmproj): used instead of the download, and images are on unless
+    # --vision no was given on this run (an earlier install's "no" was said without the file there)
+    if a.mmproj:
+        found_mm = Path(os.path.abspath(Path(a.mmproj).expanduser()))
+        why = "there is no such file" if not found_mm.is_file() else mmproj_problem(found_mm)
+        if why:
+            fail(f"--mmproj {found_mm}: {why}",
+                 "give this model's image encoder (an mmproj .gguf), or leave --mmproj out")
+    else:
+        found_mm = find_mmproj(model_folders(a, fam, model, tag, elsewhere), fam)
+    if found_mm is not None:
+        if a.mmproj is None:
+            ok(f"image encoder found next to the model: {found_mm}")
+        if cli_vision is None and a.vision == "none":
+            a.vision = None
     if MODELS[model].get("vision", fam.get("vision")) is False:     # UD-IQ4_XS: images, unlike UD-Q4_K_XL
         vision = "none"
-        if a.vision not in (None, "no", "none"):
+        if a.vision not in (None, "no", "none") or found_mm is not None:
             warn(f"images are not available with {model} yet: off")
+    elif hip and found_mm is not None and a.vision is None:
+        vision = hip_vision("cpu")                     # the AMD backend's image encoder runs on the CPU
     elif hip:
         # MODEL-UPDATE: Unsloth's files on AMD (Linux) read images with the CPU encoder by default where their experts
         # all stay in RAM (it takes no VRAM; measured on an R9700 with UD-Q4_K_XL and UD-Q5_K_XL, docs/QUANTS.md)
@@ -6304,6 +6461,10 @@ def main() -> int:
                             else "cpu")
     elif a.vision:
         vision = {"yes": "gpu", "no": "none"}.get(a.vision, a.vision)
+    elif found_mm is not None:                         # the file is the answer: no question
+        vision = "gpu"
+        say("       the image encoder keeps ~1.4 GB of VRAM free, so text is a few % slower (--vision cpu: on the CPU, "
+            "--vision no: images off)")
     else:
         say()
         say("  Images: the model can also read pictures (screenshots, photos, scanned pages). This adds a 0.9 GB")
@@ -6312,6 +6473,8 @@ def main() -> int:
         default = "y" if unsloth_images_default(model, family, ram, gpu) else "n"
         vision = "gpu" if ask("Do you want images?", ["y", "n"], default, a.yes) == "y" else "none"
     ok("images: " + {"none": "off", "gpu": "on", "cpu": "on (encoder on the CPU)"}[vision])
+    if found_mm is not None and vision == "none" and a.vision in ("no", "none"):
+        say(f"       {found_mm.name} is not used (--vision {a.vision})")
     if vision != "none" and MODELS[model].get("vision_untested"):
         warn(f"images with {model} are untested: users report them working, but we have not run this file with "
              "images (#967); tell us if the answers look wrong")
@@ -6416,7 +6579,7 @@ def main() -> int:
     mtp_have = find_in(roots, "mtp/rt/experts.bin") is not None
     q2_avx = model == "Q2_0" and avx512 and family == "qwen"
     need = to_fetch + (2 if mtp_have else 8) + \
-        (40 if q2_avx and not pack_bin else 0) + (1 if vision != "none" else 0) + \
+        (40 if q2_avx and not pack_bin else 0) + (1 if vision != "none" and found_mm is None else 0) + \
         (MODELS[model]["arena_gb"] + 1 if low_ram and not q2_avx and not pack_bin else 0)
     if free_gb(models_dir) < need:
         fail(f"not enough free disk space in {models_dir}: need ~{need:.0f} GB" +
@@ -6490,7 +6653,11 @@ def main() -> int:
     mmproj = Path(a.models_dir) / fam.get("mmproj", MMPROJ)
     if not mmproj.exists():                            # an earlier install's copy (the same file for every family)
         mmproj = find_in(roots, f"models/{fam['mmproj']}") or mmproj
-    if vision != "none":
+    if vision != "none" and found_mm is not None:      # the user's own file: checked by its headers, not downloaded
+        mmproj = found_mm
+        ok(f"vision encoder: {mmproj} (" + ("--mmproj" if a.mmproj else "found next to the model") +
+           ", nothing downloaded)")
+    elif vision != "none":
         if not mmproj.exists() and a.gguf_dir and (Path(a.gguf_dir) / fam["mmproj"]).exists():
             mmproj = Path(a.gguf_dir) / fam["mmproj"]
         else:
@@ -6498,9 +6665,9 @@ def main() -> int:
         if fam.get("mmproj_sha256"):                   # the NVFP4 family pins it by size and SHA-256 too
             verify_sha256(mmproj, *fam["mmproj_sha256"])
         ok(f"vision encoder: {mmproj}")
-        if vision == "cpu" and "BF16" in mmproj.name:       # a tip only (recommend, never force; #625)
-            say("       tip: on the CPU a Q8_0 copy of this encoder is a third smaller and about as exact (embedding "
-                "cosine 0.999 vs BF16); see 'A Q8_0 encoder' in docs/DETAILS.md")
+    if vision == "cpu" and "BF16" in mmproj.name:      # a tip only (recommend, never force; #625)
+        say("       tip: on the CPU a Q8_0 copy of this encoder is a third smaller and about as exact (embedding "
+            "cosine 0.999 vs BF16); see 'A Q8_0 encoder' in docs/DETAILS.md")
 
     # ---- 6. the pack and the MTP draft layer
     step(6, "preparing the model for Strata")
@@ -6796,6 +6963,8 @@ def main() -> int:
             cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
     elif a.vision_tokens is not None:
         warn("--vision-tokens: images are off for this model, so it is not used")
+    if found_mm is not None and vision == "none":     # off with the file there: START-HERE does not set it up again
+        cfg["vision_declined"] = str(found_mm)
     if a.images:                                       # only when given: else an earlier "images" is carried over
         cfg["images"] = setup_images(a, gpu, hip, Path(a.models_dir))
     cfg_path = ROOT / f"strata-{tag.lower()}.json"
@@ -6811,7 +6980,8 @@ def main() -> int:
             say("  " + line)
     for line in bench_tips(cfg["args"], cfg.get("env"), ram, MODELS[model]["ram_gb"], gpu.get("vram_gb", 0.0), vision, WIN):
         say("  " + line)
-    write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None)
+    write_setup_config(cfg_path, cfg, adopted if adopted is not None and adopted.name == cfg_path.name else None,
+                       keep_mmproj=found_mm is None)
     script = write_run_script(tag, cfg_path, port, cfg.get("open_browser") is not False)
     # offered only when someone answers: --yes installs and adopted earlier installs are not held up by it
     if cal is None and not hip and not a.no_start and not a.yes and ask(
