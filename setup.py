@@ -6414,7 +6414,11 @@ def main() -> int:
             fail(f"--mmproj {found_mm}: {why}",
                  "give this model's image encoder (an mmproj .gguf), or leave --mmproj out")
     else:
-        found_mm = find_mmproj(model_folders(a, fam, model, tag, elsewhere), fam)
+        looked = model_folders(a, fam, model, tag, elsewhere)
+        found_mm = find_mmproj(looked, fam)
+        if found_mm is None and MODELS[model].get("vision", fam.get("vision")) is not False:
+            say(f"  (no image encoder - an mmproj*.gguf - next to the model in {looked[0]}: one put there is used "
+                "and turns images on)")
     if found_mm is not None:
         if a.mmproj is None:
             ok(f"image encoder found next to the model: {found_mm}")
@@ -6973,7 +6977,11 @@ def main() -> int:
             + ("" if a.api_key else " - no API key set: anyone on your network can use it"))
     say(f"  Next time:        just run {'START-HERE.bat' if WIN else './setup.sh'} (or {script.name}) - it starts right away")
     if vision != "none":
-        say("  Images:           send them in the chat page, in chat.py (/image <path>) or over the API")
+        say("  Images:           send them in the chat page, in chat.py (/image <path>) or over the API (image "
+            f"encoder: {mmproj})")
+    else:
+        say("  Images:           off - this model reads text only (put its mmproj*.gguf next to its model files and "
+            "run setup again to turn them on)")
     if cfg.get("images"):
         say(f"  Image generation: POST http://127.0.0.1:{port}/v1/images/generations (OpenAI's images API)")
     if a.parallel is None:                             # #465: the opt-in, said once (nothing changes)

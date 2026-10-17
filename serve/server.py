@@ -2869,7 +2869,8 @@ def vision_from_mmproj(cfg: dict, asked: str | None = None) -> tuple[str | None,
     engine, as setup sets it up: on the GPU with NVIDIA, on the CPU with AMD; the engine gets --vision and, for a GPU
     encoder, the encoder's VRAM reserve.  A config with its own "vision" section is left as it is, and so is one that
     left images off with this file there ("vision_declined").  `cfg` is updated in place.  Returns the line to say at
-    the start (None: nothing to say) and the engine arguments added (taken back if the encoder does not start)."""
+    the start - with images off, why (None: the config's own section, said by the caller) - and the engine arguments
+    added (taken back if the encoder does not start)."""
     from serve.mmproj import mmproj_problem, scan
     if cfg.get("vision"):
         return None, []
@@ -2883,18 +2884,21 @@ def vision_from_mmproj(cfg: dict, asked: str | None = None) -> tuple[str | None,
         where = "--mmproj"
     else:
         if not native:
-            return None, []
+            return "[strata] images: off - the config names no model file (--native) to look for an encoder beside", []
         good, passed = scan([Path(native).parent])
         if not good:
-            return ("[strata] images: off - " + "; ".join(f"{p.name} next to the model is not used: {why}"
-                                                         for p, why in passed) if passed else None), []
+            return ("[strata] images: off - " + ("; ".join(f"{p} is not used: {why}" for p, why in passed) if passed
+                    else f"no image encoder (mmproj*.gguf) next to the model in {Path(native).parent}")), []
         mm, where = good[0], "found next to the model"
         if str(mm) == cfg.get("vision_declined"):
-            return None, []
+            return (f"[strata] images: off - setup left them off for this model with {mm.name} there (--vision no, "
+                    "or a model or engine without images); run setup again without --vision no to turn them on"), []
     backend = cfg.get("backend")
     vexe = Path(str(cfg.get("exe", ""))).parent / ("strata-vision.exe" if os.name == "nt" else "strata-vision")
     if backend == "sycl" or (backend == "hip" and os.name == "nt") or not native:
-        return (f"[strata] images: off - {mm.name} ({where}) is not used: this engine has no image encoder yet"), []
+        return (f"[strata] images: off - {mm.name} ({where}) is not used: this engine has no image encoder yet ("
+                + ("Intel Arc" if backend == "sycl" else "the ready-made Windows AMD engine has no strata-vision.exe"
+                   if backend == "hip" else "no --native model file in the config") + ")"), []
     if not vexe.is_file():
         return (f"[strata] images: off - {mm.name} ({where}) is not used yet: the image encoder program "
                 f"({vexe.name}) is not installed. Run START-HERE.bat once (Linux: ./setup.sh): it sets images up "
@@ -3080,6 +3084,7 @@ class Service:
                  vision: Vision | None = None, sampling_defaults: dict | None = None,
                  fit_max_tokens: bool = False):
         self.engine, self.tok, self.template, self.model, self.vision = engine, tokenizer, template, model_name, vision
+        self.vision_off_why = None                       # why images are off, said at the start (main) and in the 400
         self.literals = literal_tags(getattr(tokenizer, "control_tokens", ()))   # texts that stay text inside a message
         self.fit_max_tokens = fit_max_tokens          # --fit-max-tokens: clamp the output cap instead of 400
         self.aliases: list[str] = []                  # #297: other names of the model (the config's `aliases`)
@@ -3912,9 +3917,9 @@ class Service:
         images = images_of(messages)
         if images:
             if self.vision is None:
-                raise ValueError("this server was started without the vision encoder, so it cannot read images: put "
-                                 "the model's mmproj .gguf next to its model files and start it again (or run setup "
-                                 "again and choose images)")
+                why = self.vision_off_why or ("put the model's mmproj .gguf next to its model files and start it "
+                                              "again, or run setup again and choose images")
+                raise ValueError(f"this server was started without the vision encoder, so it cannot read images: {why}")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
             start = self.tok.encode(VISION_START, parse_special=True)[0]
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
@@ -6751,6 +6756,7 @@ def main() -> int:
         types = json.loads((tpath / "token_type.json").read_text())
         tok = ST.Tokenizer(tokens, merges, types)
     hub = hub_from_config(cfg, a.mcp_config)            # before the minutes of loading: a bad entry stops here
+    vision_off = None                                   # why images are off (said at the start, and in the 400)
     if a.engine == "strata":
         if not cfg:
             ap.error("--engine strata needs --config")
@@ -6789,9 +6795,12 @@ def main() -> int:
                 if configured:                          # the config's own encoder: as before
                     raise
                 # one turned on for this start only (vision_from_mmproj): the model starts without it
-                print(f"[strata] images: off - {e}", flush=True)
+                vnote = f"[strata] images: off - {e}"
+                print(vnote, flush=True)
                 cfg.pop("vision")
                 del cfg["args"][len(cfg["args"]) - len(vadded):]   # the arguments it appended
+        if vision is None and vnote:
+            vision_off = vnote.split("images: off - ", 1)[-1]
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080
@@ -6841,6 +6850,7 @@ def main() -> int:
                   model_name=default_model_name(cfg), vision=vision,
                   sampling_defaults=sampling_defaults,
                   fit_max_tokens=a.fit_max_tokens or cfg.get("fit_max_tokens") is True)
+    svc.vision_off_why = vision_off
     svc.reasoning_close_retry = cfg.get("reasoning_close_retry") is True    # #1053: opt-in, off by default
     if cfg.get("images"):                               # image generation (serve/images.py), set up by setup --images
         icfg = {k: (os.path.abspath(os.path.join(cfg.get("cwd") or ".", v))

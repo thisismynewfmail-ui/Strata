@@ -97,15 +97,23 @@ class FromMmproj(unittest.TestCase):
     def test_left_as_it_was(self):
         mm = encoder(self.models / "mmproj-x.gguf")
         own = {"exe": "v", "mmproj": "/mine/mmproj-Q8_0.gguf", "gpu": False}
-        for cfg in (self.cfg(vision=dict(own)), self.cfg(vision_declined=str(mm))):
-            before = json.dumps(cfg)
-            self.assertEqual(server.vision_from_mmproj(cfg), (None, []))
-            self.assertEqual(json.dumps(cfg), before)
-        self.assertEqual(server.vision_from_mmproj(self.cfg(vision=dict(own)), str(mm)), (None, []))   # the config wins
+        cfg = self.cfg(vision=dict(own))
+        before = json.dumps(cfg)
+        self.assertEqual(server.vision_from_mmproj(cfg), (None, []))       # the caller says "images: on"
+        self.assertEqual(server.vision_from_mmproj(cfg, str(mm)), (None, []))   # the config wins over --mmproj
+        self.assertEqual(json.dumps(cfg), before)
+        cfg = self.cfg(vision_declined=str(mm))                             # left off on purpose: said, not changed
+        before = json.dumps(cfg)
+        note, added = server.vision_from_mmproj(cfg)
+        self.assertIn("images: off - setup left them off", note)
+        self.assertEqual((json.dumps(cfg), added), (before, []))
 
     def test_nothing_there(self):
         cfg = self.cfg()
-        self.assertEqual(server.vision_from_mmproj(cfg), (None, []))
+        note, added = server.vision_from_mmproj(cfg)
+        self.assertEqual(note, f"[strata] images: off - no image encoder (mmproj*.gguf) next to the model in "
+                               f"{self.models}")
+        self.assertEqual(added, [])
         self.assertNotIn("vision", cfg)
 
     def test_says_why_not(self):
@@ -134,6 +142,25 @@ class FromMmproj(unittest.TestCase):
         self.assertIn("--mmproj", note)
         note, _ = server.vision_from_mmproj(self.cfg(), str(Path(self.tmp.name) / "missing.gguf"))
         self.assertIn("there is no such file", note)
+
+
+class RefusalSaysWhy(unittest.TestCase):
+    def test_the_400_names_the_reason(self):
+        svc = server.Service.__new__(server.Service)
+        svc.vision = None
+        svc.tok = Tok()
+        svc.embeddings = SimpleNamespace(path=None, keys=None)
+        svc._note_unreadable_tool_images = lambda messages, cancel: None
+        svc.encode_prompt = lambda messages, tools, kwargs: [0]
+        msgs = [{"role": "user", "content": [{"type": "image", "source": "data:image/png;base64,AA=="},   # normalized
+                                             {"type": "text", "text": "what is this?"}]}]
+        for why, want in ((None, "put the model's mmproj .gguf next to its model files"),
+                          ("no image encoder (mmproj*.gguf) next to the model in D:\\m", "next to the model in D:\\m")):
+            svc.vision_off_why = why
+            with self.assertRaises(ValueError) as e:
+                svc.prepare(msgs, None, {})
+            self.assertIn("started without the vision encoder", str(e.exception))
+            self.assertIn(want, str(e.exception))
 
 
 class Tok:

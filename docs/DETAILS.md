@@ -1477,7 +1477,9 @@ the file's headers first and names any file it does not use, with the reason: no
 for another model (its `clip.vision.projection_dim` is not 2560, this model's width). With several, the model's own
 file name comes first; `--mmproj FILE` picks one by hand. With images on, `run-<model>.bat` (`.sh`) names the
 encoder too (`--mmproj <file>` on the server's line, and a comment line saying so), and every start says it while
-the model loads: `[strata] images: on - image encoder <file> (on the GPU)`.
+the model loads: `[strata] images: on - image encoder <file> (on the GPU)`. With images off it says why instead
+(`[strata] images: off - no image encoder (mmproj*.gguf) next to the model in <folder>`, a file it does not use and the
+reason, an engine without an encoder), and a picture sent to that server is refused with the same reason.
 
 An encoder put there after setup is used from the next start on, however it is started. `run-<model>.bat` (the
 server) turns images on for that start with the `strata-vision` beside the engine, the same way setup would, and
