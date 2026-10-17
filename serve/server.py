@@ -2862,6 +2862,58 @@ def vision_env(cfg: dict, env: dict) -> dict:
     return env
 
 
+def vision_from_mmproj(cfg: dict, asked: str | None = None) -> tuple[str | None, list]:
+    """Images for a start whose config has no "vision" section: the image encoder `asked` for (--mmproj, which
+    run-<model>.bat passes when setup turned images on), else an mmproj*.gguf next to the model's --native file (put
+    there after setup).  It is checked as setup checks it (serve/mmproj.py) and run with the strata-vision beside the
+    engine, as setup sets it up: on the GPU with NVIDIA, on the CPU with AMD; the engine gets --vision and, for a GPU
+    encoder, the encoder's VRAM reserve.  A config with its own "vision" section is left as it is, and so is one that
+    left images off with this file there ("vision_declined").  `cfg` is updated in place.  Returns the line to say at
+    the start (None: nothing to say) and the engine arguments added (taken back if the encoder does not start)."""
+    from serve.mmproj import mmproj_problem, scan
+    if cfg.get("vision"):
+        return None, []
+    args = cfg.get("args") if isinstance(cfg.get("args"), list) else []
+    native = next((str(args[i + 1]) for i, x in enumerate(args[:-1]) if x == "--native"), None)
+    if asked:
+        mm = Path(os.path.abspath(asked))
+        why = "there is no such file" if not mm.is_file() else mmproj_problem(mm)
+        if why:
+            return f"[strata] images: off - --mmproj {mm}: {why}", []
+        where = "--mmproj"
+    else:
+        if not native:
+            return None, []
+        good, passed = scan([Path(native).parent])
+        if not good:
+            return ("[strata] images: off - " + "; ".join(f"{p.name} next to the model is not used: {why}"
+                                                         for p, why in passed) if passed else None), []
+        mm, where = good[0], "found next to the model"
+        if str(mm) == cfg.get("vision_declined"):
+            return None, []
+    backend = cfg.get("backend")
+    vexe = Path(str(cfg.get("exe", ""))).parent / ("strata-vision.exe" if os.name == "nt" else "strata-vision")
+    if backend == "sycl" or (backend == "hip" and os.name == "nt") or not native:
+        return (f"[strata] images: off - {mm.name} ({where}) is not used: this engine has no image encoder yet"), []
+    if not vexe.is_file():
+        return (f"[strata] images: off - {mm.name} ({where}) is not used yet: the image encoder program "
+                f"({vexe.name}) is not installed. Run START-HERE.bat once (Linux: ./setup.sh): it sets images up "
+                "for this model"), []
+    gpu = backend != "hip"
+    cfg["vision"] = {"exe": str(vexe), "mmproj": str(mm), "model": native, "gpu": gpu, "max_tokens": 1024 if gpu else 300}
+    if not gpu:
+        cfg["vision"]["threads"] = max(1, (os.cpu_count() or 8) // 2)
+    added = []
+    if "--vision" not in args:
+        added.append("--vision")
+    if gpu and "--vram-reserve-mib" not in args:
+        added += ["--vram-reserve-mib", "700"]         # setup's reserve for the GPU encoder
+    args += added
+    cfg["args"] = args
+    return (f"[strata] images: ON - image encoder {mm} ({where}; this config had no \"vision\" section: "
+            f"START-HERE.bat, Linux ./setup.sh, writes it in for good)"), added
+
+
 class ByteTokenizer:
     """Tiny stand-in tokenizer for tests without the pack: one id per UTF-8 byte, specials as ids >= 256."""
     SPECIALS = ["<|im_start|>", "<|im_end|>", "<|endoftext|>", "<|vision_start|>", "<|image_pad|>", "<|vision_end|>"]
@@ -3860,8 +3912,9 @@ class Service:
         images = images_of(messages)
         if images:
             if self.vision is None:
-                raise ValueError("this server was started without the vision encoder (run setup again and choose "
-                                 "'vision'), so it cannot read images")
+                raise ValueError("this server was started without the vision encoder, so it cannot read images: put "
+                                 "the model's mmproj .gguf next to its model files and start it again (or run setup "
+                                 "again and choose images)")
             pad = self.tok.encode(IMAGE_PAD, parse_special=True)[0]
             start = self.tok.encode(VISION_START, parse_special=True)[0]
             # An image URL is downloaded first, outside the FIFO: under it, a slow server held every other request
@@ -6662,6 +6715,10 @@ def main() -> int:
     ap.add_argument("--slot-save-path", default=None, metavar="DIR",
                     help="enable POST /slots/0?action=save|restore {\"filename\": NAME} (llama-server's API): the "
                          "conversation the engine holds, to or from DIR/NAME (also \"slot_save_path\" in the config)")
+    ap.add_argument("--mmproj", metavar="FILE",
+                    help="the image encoder (an mmproj .gguf): images on with it when the config has no \"vision\" "
+                         "section (run-<model>.bat passes the one setup chose; a config's own section wins). Without "
+                         "it, an mmproj*.gguf next to the model's files turns images on the same way")
     ap.add_argument("--replicas", type=int, default=None, metavar="N",
                     help="data-parallel replicas (opt-in): cut the \"gpu\" list into N equal groups and run one engine on "
                          "each, requests spread over them (also \"replicas\" in the config: a number, or "
@@ -6704,6 +6761,14 @@ def main() -> int:
             pretty = ", ".join(f"{k}={v}" for k, v in sampling_defaults.items())
             print(f"[strata] sampling defaults from the config: {pretty}", flush=True)
         lazy = a.lazy or cfg.get("lazy_load") is True
+        configured = bool(cfg.get("vision"))
+        vnote, vadded = vision_from_mmproj(cfg, a.mmproj)
+        if vnote:
+            print(vnote, flush=True)
+        if configured:
+            v = cfg["vision"]
+            print(f"[strata] images: on - image encoder {v.get('mmproj')} (on the {'GPU' if v.get('gpu') else 'CPU'})",
+                  flush=True)
         if cfg.get("vision"):
             elastic = cfg["vision"].get("elastic") is True and cfg.get("vram_elastic") is True
             print("the vision encoder starts with the first picture (elastic) ..." if elastic else
@@ -6717,8 +6782,16 @@ def main() -> int:
                 print('[strata] the vision section\'s "elastic" needs "vram_elastic": true (the expert cache gives the '
                       "encoder its VRAM): the encoder starts with the model instead", flush=True)
                 vcfg["elastic"] = False
-            vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
-                            env=vision_env(cfg, env), lazy=lazy)
+            try:
+                vision = Vision(vcfg, log=open(cfg["log"], "a", encoding="utf-8") if cfg.get("log") else None,
+                                env=vision_env(cfg, env), lazy=lazy)
+            except RuntimeError as e:
+                if configured:                          # the config's own encoder: as before
+                    raise
+                # one turned on for this start only (vision_from_mmproj): the model starts without it
+                print(f"[strata] images: off - {e}", flush=True)
+                cfg.pop("vision")
+                del cfg["args"][len(cfg["args"]) - len(vadded):]   # the arguments it appended
         print("model unloaded; the first request loads it ..." if lazy else
               "loading the model (the first start takes a minute or two) ...", flush=True)
         warn_budget_over_ram(engine_args(cfg) if "args" in cfg else [])      # #1080

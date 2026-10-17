@@ -132,7 +132,9 @@ setup warns when it finds 13.2.0 or 13.2.1 for such a card, and takes an older 1
 
 **Pictures are refused, or slow.**
 "this server was started without the vision encoder": the model was set up for text only - run setup again with
-`--vision gpu` (or `--vision cpu`). Pictures that take several seconds (about 3 s at 300 image tokens on 8 cores, more with more tokens) are read by the encoder on the CPU; `--vision gpu`
+`--vision gpu` (or `--vision cpu`), or put the model's `mmproj*.gguf` next to its model files and start it again.
+The server's window says at the start whether images are on and with which encoder (`[strata] images: ...`); a file
+it does not use is named there with the reason. Pictures that take several seconds (about 3 s at 300 image tokens on 8 cores, more with more tokens) are read by the encoder on the CPU; `--vision gpu`
 (NVIDIA, ~1.4 GB of VRAM) makes it 0.1-0.5 s.
 
 ## AMD cards

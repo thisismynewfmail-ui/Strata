@@ -62,6 +62,10 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
 WIN = os.name == "nt"
+if str(ROOT) not in sys.path:                          # imported by file path (tools/strata_mcp.py): serve/ beside it
+    sys.path.insert(0, str(ROOT))
+from serve.mmproj import FLASH_NEXT_EMBD, mmproj_name, mmproj_problem, scan as scan_mmproj  # noqa: E402,F401
+
 # #214: every Hugging Face file comes from a fixed commit of its repository (the `sha` of
 # https://huggingface.co/api/models/<repo> when this was pinned), so a checkout installs the same files on any
 # day.  A revision the repository no longer has falls back to its current files, with a message (download()).
@@ -1787,62 +1791,20 @@ def gguf_dir_problem(folder: Path, first: Path, fam: dict, model: str) -> tuple 
 
 
 # An image encoder the user put next to the model's files (an mmproj*.gguf, as the GGUF repositories ship it): setup
-# uses it instead of downloading one, and images are on without the question.  Every Flash-Next family's text model is
-# 2560 wide (qwen4exp.embedding_length), so an encoder made for another model is told apart by its projection width -
-# strata-vision reads that width from clip.vision.projection_dim and refuses a file without it.
-FLASH_NEXT_EMBD = 2560
-
-
-def mmproj_name(name: str) -> bool:
-    """A file name an image encoder goes by: "mmproj" in it, a .gguf (or .mmproj) file."""
-    n = name.lower()
-    return "mmproj" in n and n.endswith((".gguf", ".mmproj"))
-
-
-def mmproj_problem(p: Path) -> str | None:
-    """Why `p` cannot be this model's image encoder (not a GGUF, no vision encoder in it, made for a model of another
-    width, cut off), from its headers only; None when strata-vision can use it."""
-    sys.path.insert(0, str(ROOT / "tools"))
-    from gguf_reader import GGUFFile
-    try:
-        g = GGUFFile(p)
-    except (OSError, ValueError, KeyError, struct.error) as e:
-        return f"not a GGUF file setup can read ({e})"
-    md = getattr(g, "metadata", None) or {}
-    if md.get("general.architecture") != "clip" or md.get("clip.has_vision_encoder") is False:
-        return "it is not an image encoder"
-    width = md.get("clip.vision.projection_dim")
-    if not isinstance(width, int):
-        return "it has no clip.vision.projection_dim, which strata-vision needs"
-    if width != FLASH_NEXT_EMBD:
-        return f"it is made for another model (its projection is {width} wide, this model's is {FLASH_NEXT_EMBD})"
-    if p.stat().st_size < g.data_start + max((t.offset + (t.expected_bytes() or 0) for t in g.tensors), default=0):
-        return "it is cut off (shorter than its own tensor directory says): a download that did not finish?"
-    return None
+# uses it instead of downloading one, and images are on without the question.  The checks are serve/mmproj.py's, which
+# the server shares (it turns images on with such a file for a start whose config has none).
 
 
 def find_mmproj(folders, fam: dict, quiet: bool = False) -> Path | None:
     """The image encoder next to the model's files: in the first of `folders` that has a usable one, the family's own
     file name first, then by name.  A file that cannot be used is named with the reason (unless quiet)."""
-    for folder in dict.fromkeys(Path(f) for f in folders):
-        try:
-            cands = sorted((p for p in folder.iterdir() if mmproj_name(p.name) and p.is_file()),
-                           key=lambda p: (p.name != fam.get("mmproj"), p.name.lower()))
-        except OSError:                                # no such folder (yet)
-            continue
-        good = []
-        for p in cands:
-            why = mmproj_problem(p)
-            if why is None:
-                good.append(Path(os.path.abspath(p)))
-            elif not quiet:
-                warn(f"{p} is not used as the image encoder: {why}")
-        if good:
-            if len(good) > 1 and not quiet:
-                say(f"  {len(good)} image encoders are next to the model: {good[0].name} is used "
-                    f"(--mmproj FILE picks another: {', '.join(x.name for x in good[1:])})")
-            return good[0]
-    return None
+    good, passed = scan_mmproj(folders, fam.get("mmproj"))
+    for p, why in ([] if quiet else passed):
+        warn(f"{p} is not used as the image encoder: {why}")
+    if len(good) > 1 and not quiet:
+        say(f"  {len(good)} image encoders are next to the model: {good[0].name} is used "
+            f"(--mmproj FILE picks another: {', '.join(x.name for x in good[1:])})")
+    return good[0] if good else None
 
 
 def model_folders(a, fam: dict, model: str, tag: str, elsewhere: list) -> list:
@@ -5504,17 +5466,27 @@ def use_cuda12(cards, cfg_path: Path, cfg: dict, yes: bool) -> dict:
 
 
 def write_run_script(model, cfg_path, port, open_browser=True):
-    """run-<model>.bat / .sh: the server with this config; `open_browser` False (#609: --no-browser) leaves --open out."""
+    """run-<model>.bat / .sh: the server with this config; `open_browser` False (#609: --no-browser) leaves --open out.
+    With images on, the config's image encoder is named too (--mmproj, and a comment line saying so): the server
+    turns images on with it even for a config whose "vision" section is gone (the config's own section wins)."""
     serve = [sys.executable, str(ROOT / "serve" / "server.py"), "--engine", "strata", "--config", str(cfg_path),
              "--port", str(port)] + (["--open"] if open_browser else [])
+    try:
+        vis = json.loads(Path(cfg_path).read_text(encoding="utf-8-sig")).get("vision")
+    except (OSError, ValueError, AttributeError):
+        vis = None
+    mm = vis.get("mmproj") if isinstance(vis, dict) else None
+    if mm:
+        serve += ["--mmproj", str(mm)]
     if WIN:
         script = ROOT / f"run-{model.lower()}.bat"
-        script.write_text("@echo off\r\ntitle Strata " + model + "\r\ncd /d \"" + str(ROOT) + "\"\r\n" +
+        script.write_text("@echo off\r\ntitle Strata " + model + "\r\n" +
+                          (f"rem Images: on - image encoder {mm}\r\n" if mm else "") + "cd /d \"" + str(ROOT) + "\"\r\n" +
                           " ".join(f'"{x}"' for x in serve) + "\r\nif errorlevel 1 pause\r\n", encoding="utf-8")
     else:
         script = ROOT / f"run-{model.lower()}.sh"
-        script.write_text("#!/bin/sh\ncd \"" + str(ROOT) + "\"\nexec " + " ".join(f'"{x}"' for x in serve) + "\n",
-                          encoding="utf-8")
+        script.write_text("#!/bin/sh\n" + (f"# Images: on - image encoder {mm}\n" if mm else "") + "cd \"" + str(ROOT) +
+                          "\"\nexec " + " ".join(f'"{x}"' for x in serve) + "\n", encoding="utf-8")
         script.chmod(0o755)
     return script
 
