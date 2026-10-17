@@ -1475,10 +1475,20 @@ or `--vision no` as usual). The rest is the same as answering yes: the engine st
 VRAM reserve, `strata-vision` is fetched or built, and the run config's `"vision"` section names the file. Setup reads
 the file's headers first and names any file it does not use, with the reason: not an image encoder, cut off, or made
 for another model (its `clip.vision.projection_dim` is not 2560, this model's width). With several, the model's own
-file name comes first; `--mmproj FILE` picks one by hand. An encoder put there after setup: the next start with
-`START-HERE.bat` (Linux: `./setup.sh`) sets that model up again with images, with its other settings kept and nothing
-big downloaded (`run-<model>.bat` starts the server directly, so it does not look). After `--vision no` with the file
-there, the config remembers it as `"vision_declined"` and starts do not ask again.
+file name comes first; `--mmproj FILE` picks one by hand. With images on, `run-<model>.bat` (`.sh`) names the
+encoder too (`--mmproj <file>` on the server's line, and a comment line saying so), and every start says it while
+the model loads: `[strata] images: on - image encoder <file> (on the GPU)`. With images off it says why instead
+(`[strata] images: off - no image encoder (mmproj*.gguf) next to the model in <folder>`, a file it does not use and the
+reason, an engine without an encoder), and a picture sent to that server is refused with the same reason.
+
+An encoder put there after setup is used from the next start on, however it is started. `run-<model>.bat` (the
+server) turns images on for that start with the `strata-vision` beside the engine, the same way setup would, and
+says so (`[strata] images: ON - image encoder <file> (found next to the model; ...)`); when it cannot (no
+`strata-vision` installed, a file for another model) it says why, and the model starts without images.
+`START-HERE.bat` (Linux: `./setup.sh`) writes it into the config for good: it sets that model up again with images,
+its other settings kept and nothing big downloaded. After `--vision no` with the file there, the config remembers it
+as `"vision_declined"` and neither the server nor START-HERE turns it on again. A config's own `"vision"` section
+always wins over a file found or named at the start.
 
 | Encoder on | Time per picture | Cost |
 | --- | --- | --- |

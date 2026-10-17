@@ -54,6 +54,7 @@ class Reader:
 
 
 READER = mock.patch.dict(sys.modules, {"gguf_reader": types.SimpleNamespace(GGUFFile=Reader.GGUFFile)})
+REAL_RUN_SCRIPT = setup.write_run_script              # install() replaces it
 
 
 class Install(unittest.TestCase):
@@ -203,6 +204,35 @@ class Install(unittest.TestCase):
         self.assertEqual(Path(a[a.index("--native") + 1]).parent, own)
         self.assertEqual(cfg["vision"]["mmproj"], str(mm))
 
+    def test_setup_bat_swift_iq3_s(self):
+        # SETUP.bat (START-HERE.bat --setup): Swift 1.5, IQ3_S from the menus, the encoder next to the model; the
+        # real run-swift-iq3_s.bat is written
+        swift = setup.FAMILIES["swift"]
+        folder = self.models / (swift["tag"] + "IQ3_S")
+        mm = encoder(folder / "mmproj-Swift-Qwen3.8-Flash-Next-GSQ-RCO.gguf")
+        written = {}
+
+        def run_script(*a, **k):
+            p = REAL_RUN_SCRIPT(*a, **k)
+            written[p.name] = p.read_bytes().decode("utf-8")
+            return p
+        names = [m for m in setup.MODELS if "swift" in setup.MODELS[m].get("families", ("qwen", "swift"))]
+        names.sort(key=lambda m: bool(setup.MODELS[m].get("experimental")))
+        code, out, cfg, asked = install(self.ram, self.found, ["--setup", "--no-start", "--models-dir", str(self.models)],
+                                        answers={"Which model?": "2", "Which size?": str(names.index("IQ3_S") + 1)},
+                                        extra=[READER, mock.patch.object(setup, "WIN", True),
+                                               mock.patch.object(setup, "write_run_script", run_script)])
+        self.assertEqual(code, 0, out)
+        self.assertEqual(cfg["model_name"], "swift-1.5-iq3_s")
+        self.assertFalse(any("images" in q.lower() for q in asked), asked)
+        self.assertEqual(cfg["vision"]["mmproj"], str(mm))
+        self.assertTrue(cfg["vision"]["gpu"])
+        self.assertIn("--vision", cfg["args"])
+        bat = written["run-swift-iq3_s.bat"]
+        self.assertIn(f'"--mmproj" "{mm}"', bat)
+        self.assertIn(f"rem Images: on - image encoder {mm}\r\n", bat)
+        self.assertIn("start script: run-swift-iq3_s.bat", out)
+
     def test_start_here_just_starts_when_images_were_declined(self):
         mm = encoder(self.folder / "mmproj-Qwen3.8-Flash-Next-BF16.gguf")
         code, out, first, _ = self.run_setup("--vision", "no")
@@ -292,6 +322,24 @@ class Helpers(unittest.TestCase):
         self.assertIsNone(check({**cfg, "backend": "sycl"}))                  # no encoder on Intel Arc
         with mock.patch.object(setup, "WIN", True):
             self.assertIsNone(check({**cfg, "backend": "hip"}))               # nor in the Windows AMD engine
+
+    def test_run_script_names_the_encoder(self):
+        mm = str(self.t / "models" / "swift-IQ3_S" / "mmproj-Swift-Qwen3.8-Flash-Next-GSQ-RCO.gguf")
+        cfg = self.t / "strata-swift-iq3_s.json"
+        for win, name in ((True, "run-swift-iq3_s.bat"), (False, "run-swift-iq3_s.sh")):
+            with mock.patch.object(setup, "ROOT", self.t), mock.patch.object(setup, "WIN", win):
+                cfg.write_text(json.dumps({"exe": "x", "args": [], "vision": {"mmproj": mm, "gpu": True}}))
+                text = setup.write_run_script("swift-IQ3_S", cfg, 8080).read_bytes().decode("utf-8")
+                self.assertEqual((self.t / name).read_bytes().decode("utf-8"), text)
+                self.assertIn(f'"--mmproj" "{mm}"', text)
+                self.assertIn(f"Images: on - image encoder {mm}", text)
+                self.assertIn(f'"--config" "{cfg}" "--port" "8080" "--open" "--mmproj"', text)
+                # a text-only model's script is as before
+                cfg.write_text(json.dumps({"exe": "x", "args": []}))
+                text = setup.write_run_script("swift-IQ3_S", cfg, 8080).read_bytes().decode("utf-8")
+                self.assertNotIn("mmproj", text)
+                self.assertNotIn("Images", text)
+                self.assertTrue(text.endswith(('"--open"\r\nif errorlevel 1 pause\r\n' if win else '"--open"\n')))
 
     def test_carry_over_keep_mmproj(self):
         mine = encoder(self.t / "mmproj-Q8_0.gguf")
